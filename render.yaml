@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: dna-workstation
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.address=0.0.0.0 --server.port=$PORT
+    envVars:
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DATABASE
+        value: dna_translation_db
+      - key: DNA_WORKSTATION_SENDER_EMAIL
+        sync: false
+      - key: DNA_WORKSTATION_SENDER_PASSWORD
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
