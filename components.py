@@ -11,21 +11,37 @@ from auth import get_db_client
 
 
 # ============================================================
-# CONSTANTS AND SESSION DEFAULTS
+# CONSTANTS
 # ============================================================
 
 DATABASE_NAME = "dna_translation_db"
 USERS_COLLECTION = "users"
 
-DEFAULT_COMPONENT_STATE: dict[str, Any] = {
-    "history_records_per_page": 10,
-    "history_show_full_by_default": False,
-    "history_page": 1,
-}
 
-for state_key, default_value in DEFAULT_COMPONENT_STATE.items():
-    if state_key not in st.session_state:
-        st.session_state[state_key] = default_value
+# ============================================================
+# SESSION STATE FIX
+# ============================================================
+
+def ensure_component_state() -> None:
+    """
+    Make sure required session-state keys exist before using them.
+    This prevents Streamlit Cloud errors such as:
+    AttributeError: st.session_state has no attribute "history_page"
+    """
+    defaults = {
+        "history_records_per_page": 10,
+        "history_show_full_by_default": False,
+        "history_page": 1,
+        "confirm_clear_entire_history": False,
+    }
+
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+# Run once when components.py is imported
+ensure_component_state()
 
 
 # ============================================================
@@ -33,7 +49,7 @@ for state_key, default_value in DEFAULT_COMPONENT_STATE.items():
 # ============================================================
 
 def _create_preview(value: Any, limit: int = 60) -> str:
-    """Return a compact one-line preview for a stored value."""
+    """Create a short preview text for long sequence/result values."""
     text = " ".join(str(value or "").split())
 
     if len(text) <= limit:
@@ -43,7 +59,7 @@ def _create_preview(value: Any, limit: int = 60) -> str:
 
 
 def _normalise_timestamp(value: Any) -> str:
-    """Convert old and new timestamp formats into readable text."""
+    """Convert different timestamp formats into readable text."""
     if value is None or value == "":
         return "Not available"
 
@@ -58,29 +74,18 @@ def _normalise_timestamp(value: Any) -> str:
 
         return parsed.strftime("%Y-%m-%d %H:%M:%S")
 
-    except (TypeError, ValueError):
+    except Exception:
         return str(value)
 
 
 def _normalise_history_record(record: dict[str, Any]) -> dict[str, Any]:
     """
-    Convert both old and new MongoDB history records into one format.
-
-    Older records may contain only:
-    sequence, result, organism, timestamp
-
-    Newer records contain full values and a stable history ID.
+    Convert old and new history formats into one display format.
+    Older records may use sequence/result.
+    Newer records use sequence_full/result_full.
     """
-    sequence = record.get(
-        "sequence_full",
-        record.get("sequence", ""),
-    )
-
-    result = record.get(
-        "result_full",
-        record.get("result", ""),
-    )
-
+    sequence = record.get("sequence_full", record.get("sequence", ""))
+    result = record.get("result_full", record.get("result", ""))
     organism = record.get("organism", "N/A")
 
     analysis_type = record.get("analysis_type")
@@ -105,17 +110,31 @@ def _normalise_history_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _get_user_history(username: str) -> tuple[list[dict[str, Any]], str | None]:
-    """Read a user's embedded history array from MongoDB."""
+# ============================================================
+# DATABASE HELPERS
+# ============================================================
+
+def _get_users_collection():
+    """Return MongoDB users collection and client."""
     client = get_db_client()
 
     if client is None:
+        return None, None
+
+    database = client[DATABASE_NAME]
+    users_collection = database[USERS_COLLECTION]
+
+    return client, users_collection
+
+
+def _get_user_history(username: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Read one user's saved history from MongoDB."""
+    client, users_collection = _get_users_collection()
+
+    if client is None or users_collection is None:
         return [], "The database connection could not be established."
 
     try:
-        database = client[DATABASE_NAME]
-        users_collection = database[USERS_COLLECTION]
-
         user_document = users_collection.find_one(
             {"username": username},
             {"history": 1},
@@ -142,16 +161,13 @@ def _delete_history_record(
     username: str,
     raw_record: dict[str, Any],
 ) -> tuple[bool, str]:
-    """Delete one embedded MongoDB history record."""
-    client = get_db_client()
+    """Delete one saved history record."""
+    client, users_collection = _get_users_collection()
 
-    if client is None:
+    if client is None or users_collection is None:
         return False, "The database connection could not be established."
 
     try:
-        database = client[DATABASE_NAME]
-        users_collection = database[USERS_COLLECTION]
-
         history_id = raw_record.get("history_id")
 
         if history_id:
@@ -160,8 +176,6 @@ def _delete_history_record(
                 {"$pull": {"history": {"history_id": history_id}}},
             )
         else:
-            # Backward compatibility for records created before history IDs
-            # were introduced.
             update_result = users_collection.update_one(
                 {"username": username},
                 {"$pull": {"history": raw_record}},
@@ -180,16 +194,13 @@ def _delete_history_record(
 
 
 def _clear_user_history(username: str) -> tuple[bool, str]:
-    """Remove all embedded history records for one user."""
-    client = get_db_client()
+    """Clear all saved history records for one user."""
+    client, users_collection = _get_users_collection()
 
-    if client is None:
+    if client is None or users_collection is None:
         return False, "The database connection could not be established."
 
     try:
-        database = client[DATABASE_NAME]
-        users_collection = database[USERS_COLLECTION]
-
         update_result = users_collection.update_one(
             {"username": username},
             {"$set": {"history": []}},
@@ -220,12 +231,8 @@ def save_search_to_history(
     codon_table: str | int | None = None,
 ) -> bool:
     """
-    Store a complete analysis record inside the registered user's document.
-
-    Full values are saved for traceability and later reuse. Short previews are
-    generated only when the record is displayed in the interface.
-
-    Guest activity is intentionally not stored.
+    Save analysis history for registered users only.
+    Guest activity is not saved.
     """
     if not username or username == "Guest":
         return False
@@ -253,15 +260,12 @@ def save_search_to_history(
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
 
-    client = get_db_client()
+    client, users_collection = _get_users_collection()
 
-    if client is None:
+    if client is None or users_collection is None:
         return False
 
     try:
-        database = client[DATABASE_NAME]
-        users_collection = database[USERS_COLLECTION]
-
         update_result = users_collection.update_one(
             {"username": username},
             {"$push": {"history": history_item}},
@@ -281,7 +285,9 @@ def save_search_to_history(
 # ============================================================
 
 def render_history_dashboard(username: str) -> None:
-    """Display, inspect, reload, download, and delete saved analyses."""
+    """Display saved analysis history."""
+    ensure_component_state()
+
     st.title("📊 Search History Log")
     st.write(
         "Review the DNA translation and BLAST analyses saved under your "
@@ -303,8 +309,8 @@ def render_history_dashboard(username: str) -> None:
 
     if not stored_history:
         st.info(
-            "Your history log is empty. Run a DNA translation or BLAST "
-            "analysis to create your first saved record."
+            "Your history log is empty. Run a DNA translation or BLAST analysis "
+            "to create your first saved record."
         )
         return
 
@@ -333,15 +339,13 @@ def render_history_dashboard(username: str) -> None:
         placeholder="Search by DNA sequence, result, organism, or analysis type",
     ).strip().lower()
 
-    filter_options = [
-        "All Analyses",
-        "DNA Translation",
-        "BLAST Validation",
-    ]
-
     selected_filter = st.selectbox(
         "Filter by analysis type",
-        filter_options,
+        [
+            "All Analyses",
+            "DNA Translation",
+            "BLAST Validation",
+        ],
     )
 
     filtered_history = []
@@ -374,63 +378,47 @@ def render_history_dashboard(username: str) -> None:
         st.warning("No history records match the selected search and filter.")
         return
 
-    records_per_page = int(
-        st.session_state.get("history_records_per_page", 10)
-    )
-
+    records_per_page = int(st.session_state.get("history_records_per_page", 10))
     records_per_page = max(5, min(records_per_page, 50))
 
     total_pages = max(
         1,
-        (len(filtered_history) + records_per_page - 1)
-        // records_per_page,
+        (len(filtered_history) + records_per_page - 1) // records_per_page,
     )
 
-    if st.session_state.history_page > total_pages:
-        st.session_state.history_page = total_pages
+    if "history_page" not in st.session_state:
+        st.session_state["history_page"] = 1
+
+    if int(st.session_state["history_page"]) > total_pages:
+        st.session_state["history_page"] = total_pages
 
     if total_pages > 1:
         selected_page = st.number_input(
             "History page",
             min_value=1,
             max_value=total_pages,
-            value=int(st.session_state.history_page),
+            value=int(st.session_state["history_page"]),
             step=1,
         )
 
-        st.session_state.history_page = int(selected_page)
+        st.session_state["history_page"] = int(selected_page)
     else:
-        st.session_state.history_page = 1
+        st.session_state["history_page"] = 1
 
-    page_start = (
-        st.session_state.history_page - 1
-    ) * records_per_page
-
+    page_start = (int(st.session_state["history_page"]) - 1) * records_per_page
     page_end = page_start + records_per_page
     page_records = filtered_history[page_start:page_end]
 
     table_rows = []
 
-    for display_index, record in enumerate(
-        page_records,
-        start=page_start + 1,
-    ):
+    for display_index, record in enumerate(page_records, start=page_start + 1):
         table_rows.append(
             {
                 "Record": display_index,
                 "Analysis Type": record["analysis_type"],
-                "DNA Sequence Preview": _create_preview(
-                    record["sequence"],
-                    55,
-                ),
-                "Result Preview": _create_preview(
-                    record["result"],
-                    55,
-                ),
-                "Organism or Description": _create_preview(
-                    record["organism"],
-                    55,
-                ),
+                "DNA Sequence Preview": _create_preview(record["sequence"], 55),
+                "Result Preview": _create_preview(record["result"], 55),
+                "Organism or Description": _create_preview(record["organism"], 55),
                 "Timestamp": record["timestamp"],
             }
         )
@@ -463,42 +451,18 @@ def render_history_dashboard(username: str) -> None:
 
     with st.expander(
         "View Complete Saved Record",
-        expanded=bool(
-            st.session_state.get(
-                "history_show_full_by_default",
-                False,
-            )
-        ),
+        expanded=bool(st.session_state.get("history_show_full_by_default", False)),
     ):
         st.write(f"**Analysis type:** {selected_record['analysis_type']}")
         st.write(f"**Timestamp:** {selected_record['timestamp']}")
         st.write(f"**Codon table:** {selected_record['codon_table']}")
-        st.write(
-            f"**Organism or description:** "
-            f"{selected_record['organism']}"
-        )
+        st.write(f"**Organism or description:** {selected_record['organism']}")
 
         st.write("**Stored DNA sequence**")
-        st.code(
-            selected_record["sequence"]
-            or "No sequence was stored."
-        )
+        st.code(selected_record["sequence"] or "No sequence was stored.")
 
         st.write("**Stored result**")
-        st.code(
-            selected_record["result"]
-            or "No result was stored."
-        )
-
-        if (
-            "..." in selected_record["sequence"]
-            and "sequence_full"
-            not in selected_record["raw_record"]
-        ):
-            st.warning(
-                "This is an older history record that stored only a shortened "
-                "sequence preview. New records store the complete sequence."
-            )
+        st.code(selected_record["result"] or "No result was stored.")
 
     action_col_1, action_col_2, action_col_3 = st.columns(3)
 
@@ -507,9 +471,9 @@ def render_history_dashboard(username: str) -> None:
             "🔁 Load DNA into Analysis Station",
             use_container_width=True,
         ):
-            st.session_state.dna = selected_record["sequence"]
-            st.session_state.last_analysis = None
-            st.session_state.active_tab = "🔬 DNA Analysis Station"
+            st.session_state["dna"] = selected_record["sequence"]
+            st.session_state["last_analysis"] = None
+            st.session_state["active_tab"] = "🔬 DNA Analysis Station"
             st.success("The saved DNA sequence was loaded.")
             st.rerun()
 
@@ -581,12 +545,10 @@ def render_history_dashboard(username: str) -> None:
 
             if cleared:
                 st.success(clear_message)
-                st.session_state.history_page = 1
+                st.session_state["history_page"] = 1
                 st.rerun()
             else:
                 st.error(clear_message)
-
-
 
 
 # ============================================================
@@ -594,16 +556,13 @@ def render_history_dashboard(username: str) -> None:
 # ============================================================
 
 def _get_all_users_for_admin() -> tuple[list[dict[str, Any]], str | None]:
-    """Read all registered user documents for the admin dashboard."""
-    client = get_db_client()
+    """Read all registered user records for admin dashboard."""
+    client, users_collection = _get_users_collection()
 
-    if client is None:
+    if client is None or users_collection is None:
         return [], "The database connection could not be established."
 
     try:
-        database = client[DATABASE_NAME]
-        users_collection = database[USERS_COLLECTION]
-
         user_documents = list(
             users_collection.find(
                 {},
@@ -627,7 +586,9 @@ def _get_all_users_for_admin() -> tuple[list[dict[str, Any]], str | None]:
 
 
 def render_admin_dashboard() -> None:
-    """Render a simple administrator dashboard for user and history monitoring."""
+    """Render a simple administrator dashboard."""
+    ensure_component_state()
+
     st.title("🛡️ Admin Dashboard")
     st.write(
         "This page allows the administrator to monitor registered users and "
@@ -649,6 +610,7 @@ def render_admin_dashboard() -> None:
         str(user.get("role", "user")).lower() == "admin"
         for user in user_documents
     )
+
     total_history_records = sum(
         len(user.get("history", []))
         for user in user_documents
@@ -700,22 +662,22 @@ def render_admin_dashboard() -> None:
     selected_username = selected_user.get("username", "")
 
     st.subheader("Selected User Details")
+
     detail_col_1, detail_col_2, detail_col_3 = st.columns(3)
     detail_col_1.metric("Username", selected_username or "N/A")
     detail_col_2.metric("Role", selected_user.get("role", "user"))
-    detail_col_3.metric(
-        "History Records",
-        len(selected_user.get("history", []))
-        if isinstance(selected_user.get("history", []), list)
-        else 0,
-    )
+
+    raw_history = selected_user.get("history", [])
+
+    if not isinstance(raw_history, list):
+        raw_history = []
+
+    detail_col_3.metric("History Records", len(raw_history))
 
     st.write(f"**Email:** {selected_user.get('email', 'N/A')}")
     st.write("**Password field:** stored as a hash value, not plain text.")
 
-    raw_history = selected_user.get("history", [])
-
-    if not isinstance(raw_history, list) or not raw_history:
+    if not raw_history:
         st.info("This user has no saved analysis history.")
         return
 
@@ -765,21 +727,13 @@ def render_admin_dashboard() -> None:
         st.write(f"**Analysis type:** {selected_record['analysis_type']}")
         st.write(f"**Timestamp:** {selected_record['timestamp']}")
         st.write(f"**Codon table:** {selected_record['codon_table']}")
-        st.write(
-            f"**Organism or description:** {selected_record['organism']}"
-        )
+        st.write(f"**Organism or description:** {selected_record['organism']}")
 
         st.write("**Stored DNA sequence**")
-        st.code(
-            selected_record["sequence"]
-            or "No sequence was stored."
-        )
+        st.code(selected_record["sequence"] or "No sequence was stored.")
 
         st.write("**Stored result**")
-        st.code(
-            selected_record["result"]
-            or "No result was stored."
-        )
+        st.code(selected_record["result"] or "No result was stored.")
 
     admin_action_col_1, admin_action_col_2 = st.columns(2)
 
@@ -830,7 +784,9 @@ def render_admin_dashboard() -> None:
 # ============================================================
 
 def render_user_guide() -> None:
-    """Render an operational guide for undergraduate students."""
+    """Render a user guide for the system."""
+    ensure_component_state()
+
     st.title("📘 User Guide Manual")
     st.write(
         "This guide explains how undergraduate bioinformatics students can "
@@ -861,9 +817,7 @@ The cleaning report identifies and removes formatting content such as FASTA head
 """
         )
 
-        st.info(
-            "A valid DNA sequence for this system contains only A, T, G, and C."
-        )
+        st.info("A valid DNA sequence for this system contains only A, T, G, and C.")
 
     with translation_tab:
         st.subheader("2. Running the Guided Translation Analysis")
@@ -875,7 +829,7 @@ The cleaning report identifies and removes formatting content such as FASTA head
 4. Inspect the nucleotide distribution.
 5. Follow the codon-to-amino-acid mapping.
 6. Review the translated protein sequence.
-7. Interpret the molecular weight, isoelectric point, instability index, and other protein properties.
+7. Interpret the molecular weight, isoelectric point, instability index, and GRAVY.
 8. Examine the identified open reading frame, when available.
 9. Download the generated student analysis report.
 
@@ -926,7 +880,6 @@ Guest analyses are not stored.
 
     with troubleshooting_tab:
         st.subheader("5. Common Messages and Solutions")
-
         st.markdown(
             """
 **Unsupported nucleotide letters detected**  
@@ -951,11 +904,13 @@ History is disabled in Guest mode. Sign in with a registered profile to save ana
 
 
 # ============================================================
-# SETTINGS
+# SETTINGS PANEL
 # ============================================================
 
 def render_settings_panel() -> None:
-    """Render preferences that are stored for the current Streamlit session."""
+    """Render settings and preferences."""
+    ensure_component_state()
+
     st.title("⚙️ System Settings")
     st.write(
         "Adjust the appearance and history-display preferences for the "
@@ -987,13 +942,11 @@ def render_settings_panel() -> None:
     )
 
     if selected_theme != current_theme:
-        st.session_state.current_theme = selected_theme
+        st.session_state["current_theme"] = selected_theme
         st.success("Theme updated successfully.")
         st.rerun()
 
-    st.caption(
-        f"Current theme: **{st.session_state.current_theme}**"
-    )
+    st.caption(f"Current theme: **{st.session_state.get('current_theme', theme_options[0])}**")
 
     st.divider()
     st.subheader("📊 History Display")
@@ -1001,30 +954,18 @@ def render_settings_panel() -> None:
     records_per_page = st.select_slider(
         "Records displayed per history page",
         options=[5, 10, 15, 20, 30, 50],
-        value=int(
-            st.session_state.get(
-                "history_records_per_page",
-                10,
-            )
-        ),
+        value=int(st.session_state.get("history_records_per_page", 10)),
     )
 
     show_full_by_default = st.checkbox(
         "Open the complete saved-record panel automatically",
-        value=bool(
-            st.session_state.get(
-                "history_show_full_by_default",
-                False,
-            )
-        ),
+        value=bool(st.session_state.get("history_show_full_by_default", False)),
     )
 
-    st.session_state.history_records_per_page = records_per_page
-    st.session_state.history_show_full_by_default = show_full_by_default
+    st.session_state["history_records_per_page"] = records_per_page
+    st.session_state["history_show_full_by_default"] = show_full_by_default
 
-    st.success(
-        "The current session preferences have been saved."
-    )
+    st.success("The current session preferences have been saved.")
 
     st.divider()
     st.subheader("🧹 Analysis Workspace")
@@ -1044,15 +985,13 @@ def render_settings_panel() -> None:
         disabled=not confirm_workspace_reset,
         use_container_width=True,
     ):
-        st.session_state.dna = ""
-        st.session_state.table = "Standard (1)"
-        st.session_state.selected_example = "Select an example"
-        st.session_state.last_analysis = None
-        st.session_state.last_upload_hash = ""
-        st.session_state.uploader_key = (
-            int(st.session_state.get("uploader_key", 0)) + 1
-        )
-        st.session_state.active_tab = "🔬 DNA Analysis Station"
+        st.session_state["dna"] = ""
+        st.session_state["table"] = "Standard (1)"
+        st.session_state["selected_example"] = "Select an example"
+        st.session_state["last_analysis"] = None
+        st.session_state["last_upload_hash"] = ""
+        st.session_state["uploader_key"] = int(st.session_state.get("uploader_key", 0)) + 1
+        st.session_state["active_tab"] = "🔬 DNA Analysis Station"
 
         st.success("The analysis workspace was reset.")
         st.rerun()
