@@ -2,7 +2,7 @@ import hashlib
 import os
 from pymongo import MongoClient
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://mashitahzamni_db_user:dbMashicat@dnatranslator.fautrdm.mongodb.net/?appName=DNATRANSLATOR")
 DATABASE_NAME = os.getenv("MONGO_DATABASE", "dna_translation_db")
 
 
