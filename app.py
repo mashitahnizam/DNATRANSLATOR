@@ -59,8 +59,8 @@ RESET_PIN_LIFETIME_SECONDS = 10 * 60
 # ============================================================
 # Configure password-recovery email with environment variables or
 # .streamlit/secrets.toml. Never commit Gmail app passwords.
-FALLBACK_SENDER_EMAIL = ""
-FALLBACK_SENDER_PASSWORD = ""
+FALLBACK_SENDER_EMAIL = "noreply.dnaworkstation@gmail.com"
+FALLBACK_SENDER_PASSWORD = "sbmkbajqpablsxnz"
 
 CODON_TABLE_OPTIONS = {
     "Standard (1)": 1,
