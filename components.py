@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-import os
 from typing import Any
 from uuid import uuid4
 
@@ -15,7 +14,7 @@ from auth import get_db_client
 # CONSTANTS AND SESSION DEFAULTS
 # ============================================================
 
-DATABASE_NAME = os.getenv("MONGO_DATABASE", "dna_translation_db")
+DATABASE_NAME = "dna_translation_db"
 USERS_COLLECTION = "users"
 
 DEFAULT_COMPONENT_STATE: dict[str, Any] = {
