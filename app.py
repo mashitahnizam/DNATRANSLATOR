@@ -277,11 +277,10 @@ DNA Workstation System
 
         return True, "Verification code sent successfully."
 
-    except Exception:
+    except Exception as e:
         return (
             False,
-            "The verification email could not be sent. Check the Gmail App "
-            "Password and internet connection, then try again.",
+            f"The verification email could not be sent. Actual error: {e}",
         )
 
 
